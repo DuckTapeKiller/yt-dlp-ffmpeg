@@ -20,6 +20,14 @@ This folder is a local Pi package for guided media download workflows.
 - Supports browser cookies/cookies.txt for YouTube login, consent, captcha, and age-gated sessions.
 - Continues playlist downloads past individual failed items by default.
 - Supports playlist item ranges and request throttling.
+- Adds selectable, list-only media previews for playlists, series, episode lists, feeds, and collection pages. Previewing never downloads media.
+- Automatically previews list-like URLs when `playlistMode` is omitted and also supports `preview: true` for an explicit preview request.
+- Shows title, date, duration, availability, and selection state without rendering thumbnails.
+- Downloads only the explicitly selected stable entry URLs, then keeps the normal Pi confirmation step before yt-dlp runs.
+- Supports up to 500 preview entries by default; set `maxPlaylistEntries` to use a smaller bound.
+- Keeps dedicated BBC and RTVE handling ahead of generic discovery, including BBC broadcast-date and RTVE emission-date filename fallbacks.
+- Adds generic JSON-LD, RSS/Atom, HTML-link, and configurable per-domain discovery extraction.
+- Adds declarative discovery-rule management via the `manage_media_discovery_rules` tool and `/mediarules` command. Rules are stored in `~/.pi/agent/extensions/yt-dlp-ffmpeg.discovery-rules.json` and support `list`, `add`, `test`, and `remove`.
 - Adds BBC/RTVE date fallback naming.
 - Adds custom website date rules via:
   - `/media-rule-add`
@@ -57,6 +65,8 @@ Example Pi tool parameters:
 ```json
 {
   "urls": ["https://www.youtube.com/playlist?list=..."],
+  "preview": true,
+  "maxPlaylistEntries": 100,
   "mode": "video",
   "videoContainer": "mp4",
   "playlistMode": "playlist",
@@ -66,7 +76,29 @@ Example Pi tool parameters:
 }
 ```
 
+For a list-like URL, the preview is automatic. In the list, use Up/Down to move, Space to toggle, `a` to select all, `n` to clear all, Enter to continue to the normal download confirmation, and Escape to cancel.
+
 Use `"chrome"`, `"firefox"`, `"brave"`, etc. instead of `"safari"` if that is where you are logged into YouTube. If a browser profile is locked, close the browser and retry. If a rightsholder blocks playback even in the browser, cookies cannot bypass that.
+
+## Generic discovery rules
+
+Use `/mediarules list` to inspect configured rules, `/mediarules add` to create one interactively, `/mediarules test` to test a page, and `/mediarules remove` to delete one. The structured tool accepts the same actions:
+
+```json
+{
+  "action": "add",
+  "name": "example-audio",
+  "domain": "example.com",
+  "urlPattern": "re:/podcasts/",
+  "entryPattern": "<article\\b[^>]*>([\\s\\S]*?)</article>",
+  "fields": {
+    "webpageUrl": "href=[\\\"']([^\\\"']+)[\\\"']",
+    "title": "<h2[^>]*>([\\s\\S]*?)</h2>"
+  }
+}
+```
+
+`entryPattern` and field patterns are bounded regular expressions. Capture group 1 supplies each value. Rules are limited to their configured domain and are used only for discovery; they never initiate a download.
 
 ## Mac + LG TV compatibility
 

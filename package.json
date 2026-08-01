@@ -1,8 +1,11 @@
 {
   "name": "pi-yt-dlp-ffmpeg-extension",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
-  "description": "Pi extension for downloading audio and video with yt-dlp and ffmpeg.",
+  "scripts": {
+    "test": "node --test test/media-preview.test.mjs"
+  },
+  "description": "Pi extension for list-first audio/video discovery, selectable previews, downloads, and ffmpeg workflows.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -19,6 +22,7 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "engines": {
