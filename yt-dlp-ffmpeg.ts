@@ -133,10 +133,16 @@ const DownloadParamsSchema = Type.Object({
       description: "Absolute destination folder path. Omit to use ~/Downloads",
     }),
   ),
+  tracklist: Type.Optional(
+    Type.Boolean({
+      description:
+        "Write a Markdown tracklist beside each downloaded BBC programme that publishes one. Defaults to true; set false only if the user asks for no tracklist.",
+    }),
+  ),
   audioFormat: Type.Optional(
     StringEnum(AUDIO_FORMATS, {
       description:
-        "Audio extension for extraction when mode=audio. Omit to choose interactively",
+        "Audio extension for mode=audio. Do NOT set this unless the user named a format themselves. Leaving it unset keeps the original audio stream with no re-encode, which is what almost every request wants; setting mp3, opus, or vorbis re-encodes already-lossy audio a second time and permanently degrades it.",
     }),
   ),
   videoContainer: Type.Optional(
@@ -559,8 +565,69 @@ function isLikelyPlaylistUrl(rawUrl: string): boolean {
   }
 }
 
+// BBC programme IDs ("pids") are 8+ lowercase alphanumerics starting with b/m/p/w.
+const BBC_PID_PATTERN = /^[bmpw][0-9a-z]{7,}$/i;
+
+// BBC Sounds paths that carry a programme pid: an episode, or a whole series.
+const BBC_SOUNDS_PID_PATHS = new Set(["play", "brand", "series"]);
+
+// Matches the bare /programmes/<pid> and /sounds/play/<pid> shapes. These usually
+// address one item, but a brand or series page is spelled identically, so callers
+// must classify with fetchBbcProgrammeKind before treating one as a single item.
+function isBbcProgrammePermalinkUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!parsed.hostname.toLowerCase().endsWith("bbc.co.uk")) return false;
+    const segments = parsed.pathname
+      .toLowerCase()
+      .split("/")
+      .filter(Boolean);
+    if (segments.length === 2 && segments[0] === "programmes")
+      return BBC_PID_PATTERN.test(segments[1]);
+    // yt-dlp fails on every /sounds/ form; all of them are rewritten to the
+    // equivalent /programmes/ URL, which its BBC extractor does handle.
+    if (
+      segments.length === 3 &&
+      segments[0] === "sounds" &&
+      BBC_SOUNDS_PID_PATHS.has(segments[1])
+    )
+      return BBC_PID_PATTERN.test(segments[2]);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function bbcPidFromUrl(rawUrl: string): string | undefined {
+  try {
+    const segments = new URL(rawUrl).pathname.split("/").filter(Boolean);
+    const pid = segments[segments.length - 1];
+    return pid && BBC_PID_PATTERN.test(pid) ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// yt-dlp's BBC extractor resolves /programmes/<pid> but fails on the Sounds
+// player URL for that same pid ("Unable to extract playlist data"), so every
+// permalink is addressed as a programme.
+function bbcProgrammeUrl(rawUrl: string): string | undefined {
+  const pid = bbcPidFromUrl(rawUrl);
+  return pid ? `https://www.bbc.co.uk/programmes/${pid}` : undefined;
+}
+
+function bbcEpisodeIndexUrl(rawUrl: string): string | undefined {
+  const pid = bbcPidFromUrl(rawUrl);
+  return pid
+    ? `https://www.bbc.co.uk/programmes/${pid}/episodes/player`
+    : undefined;
+}
+
 function isGenericMediaCollectionUrl(rawUrl: string): boolean {
   try {
+    // "programmes" is a collection marker below, which would otherwise make every
+    // single-episode permalink look like a list and trigger the entry picker.
+    if (isBbcProgrammePermalinkUrl(rawUrl)) return false;
     const parsed = new URL(rawUrl);
     const pathname = parsed.pathname.toLowerCase();
     const segments = pathname.split("/").filter(Boolean);
@@ -718,6 +785,15 @@ function extractDateFromSegment(segment: string): string | undefined {
 }
 
 function extractBbcBroadcastDate(html: string): string | undefined {
+  // JSON-LD datePublished is the original broadcast date and agrees with BBC's
+  // own first_broadcast_date. Prefer it: the "Last on" block below reports the
+  // most recent repeat, and the bare datetime scan after it can land on an
+  // availability expiry, either of which misdates the file by weeks.
+  const published = /"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2})/.exec(html);
+  if (published) {
+    const normalized = normalizeIsoDate(published[1]);
+    if (normalized) return normalized;
+  }
   const lastOnBlockMatch = html.match(
     /<h2>\s*Last on\s*<\/h2>[\s\S]{0,12000}/i,
   );
@@ -990,6 +1066,30 @@ function isMediaFileUrl(url: string): boolean {
   );
 }
 
+// Chrome/navigation links that the keyword test below would otherwise wave through.
+const NAV_ONLY_PATH_SEGMENTS = new Set([
+  "about",
+  "accessibility",
+  "audios",
+  "categories",
+  "contact",
+  "contacts",
+  "episodes",
+  "help",
+  "podcasts",
+  "privacy",
+  "programmes",
+  "register",
+  "schedules",
+  "search",
+  "series",
+  "shows",
+  "sign-in",
+  "signin",
+  "terms",
+  "videos",
+]);
+
 function isPlausibleMediaEntryUrl(url: string, sourceUrl: string): boolean {
   try {
     const candidate = new URL(url);
@@ -998,10 +1098,21 @@ function isPlausibleMediaEntryUrl(url: string, sourceUrl: string): boolean {
       return false;
     if (candidate.origin !== source.origin || candidate.href === source.href)
       return false;
+    // In-page anchors ("Skip to content") resolve to the source page plus a
+    // fragment, so href alone does not catch them.
+    if (
+      candidate.pathname === source.pathname &&
+      candidate.search === source.search
+    )
+      return false;
+    const pathname = candidate.pathname.toLowerCase();
+    const segments = pathname.split("/").filter(Boolean);
+    if (segments.length === 0) return false;
+    if (NAV_ONLY_PATH_SEGMENTS.has(segments[segments.length - 1])) return false;
     return (
       /(?:episode|podcast|audio|video|programme|program|listen|watch|media|track|item|story|show|series)/i.test(
-        candidate.pathname,
-      ) || /\d{4,}/.test(candidate.pathname)
+        pathname,
+      ) || /\d{4,}/.test(pathname)
     );
   } catch {
     return false;
@@ -1442,8 +1553,8 @@ async function runYtDlpJson(
   ];
   if (playlist) {
     args.push("--flat-playlist");
-    if (maxEntries && maxEntries > 0)
-      args.push("--playlist-end", String(maxEntries));
+    // -I supersedes --playlist-end, which is now an undocumented legacy alias.
+    if (maxEntries && maxEntries > 0) args.push("-I", `:${maxEntries}`);
   } else args.push("--no-playlist");
   appendYtDlpCookieArgs(args, options);
   args.push(url);
@@ -1479,6 +1590,91 @@ async function fetchMediaPageHtml(
   return result.code === 0 && result.stdout.trim() ? result.stdout : "";
 }
 
+// BBC serves a small JSON descriptor beside every programme page, and it names
+// the programme type, which the URL itself cannot: /programmes/<pid> is equally
+// the shape of one episode and of a whole brand.
+async function fetchBbcProgrammeKind(
+  pi: ExtensionAPI,
+  cwd: string,
+  url: string,
+  signal: AbortSignal | undefined,
+): Promise<"episode" | "collection" | undefined> {
+  try {
+    const segments = new URL(url).pathname.split("/").filter(Boolean);
+    const pid = segments[segments.length - 1];
+    if (!pid || !BBC_PID_PATTERN.test(pid)) return undefined;
+    const result = await pi.exec(
+      "curl",
+      [
+        "-sL",
+        "--max-time",
+        "15",
+        "-A",
+        "Mozilla/5.0",
+        `https://www.bbc.co.uk/programmes/${pid}.json`,
+      ],
+      { signal, cwd },
+    );
+    if (result.code !== 0 || !result.stdout.trim()) return undefined;
+    const payload = JSON.parse(result.stdout) as {
+      programme?: { type?: unknown };
+    };
+    const type = String(payload?.programme?.type ?? "").toLowerCase();
+    if (type === "episode" || type === "clip") return "episode";
+    if (type === "brand" || type === "series") return "collection";
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Swap brand/series permalinks for their episode index so yt-dlp can enumerate
+// them. Episode permalinks, and anything that will not classify, are left alone.
+async function resolveBbcProgrammeUrls(
+  pi: ExtensionAPI,
+  cwd: string,
+  urls: string[],
+  signal: AbortSignal | undefined,
+  onUpdate?: (text: string) => void,
+): Promise<string[]> {
+  if (!urls.some(isBbcProgrammePermalinkUrl)) return urls;
+  let expanded = 0;
+  let rewritten = 0;
+  const resolved = await Promise.all(
+    urls.map(async (url) => {
+      if (!isBbcProgrammePermalinkUrl(url)) return url;
+      const kind = await fetchBbcProgrammeKind(pi, cwd, url, signal);
+      // No descriptor means no /programmes/ page for this pid — Sounds carries
+      // podcast-only content that lives nowhere else. Leave those alone rather
+      // than rewriting them to a URL that does not exist, so the user sees
+      // yt-dlp's error about the link they actually gave.
+      if (!kind) return url;
+      const target =
+        kind === "collection" ? bbcEpisodeIndexUrl(url) : bbcProgrammeUrl(url);
+      if (!target || target === url) return url;
+      if (kind === "collection") expanded += 1;
+      else rewritten += 1;
+      return target;
+    }),
+  );
+  const notes: string[] = [];
+  if (expanded > 0)
+    notes.push(
+      `expanded ${expanded} BBC ${
+        expanded === 1 ? "index" : "indexes"
+      } into episode lists`,
+    );
+  if (rewritten > 0)
+    notes.push(
+      rewritten === 1
+        ? "rewrote 1 BBC Sounds link to its programme page"
+        : `rewrote ${rewritten} BBC Sounds links to their programme pages`,
+    );
+  if (notes.length > 0)
+    onUpdate?.(notes.join("; ").replace(/^./, (c) => c.toUpperCase()));
+  return dedupeUrls(resolved);
+}
+
 async function discoverGenericMediaEntries(
   pi: ExtensionAPI,
   cwd: string,
@@ -1509,6 +1705,19 @@ async function discoverGenericMediaEntries(
       ? ""
       : "No structured media entries were found in the page HTML",
   };
+}
+
+// Same episode, different spelling: index pages hand out http:// links while a
+// direct resolution reports https://. Compare on host + path so both collapse.
+function mediaDedupeKey(value: string): string {
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const path = parsed.pathname.replace(/\/+$/, "").toLowerCase();
+    return `${host}${path}${parsed.search}`;
+  } catch {
+    return value.trim().toLowerCase();
+  }
 }
 
 function normalizeMediaCandidate(
@@ -1622,6 +1831,20 @@ async function hydrateMediaEntries(
   return result;
 }
 
+// True when yt-dlp returned a single playable item rather than a list. Such a
+// result already identifies exactly what to download, so no picker is needed.
+function isResolvedSingleMedia(data: Record<string, any> | null): boolean {
+  if (!data || typeof data !== "object") return false;
+  if (data._type === "playlist" || data._type === "multi_video") return false;
+  if (Array.isArray(data.entries)) return false;
+  if (!data.id && !data.title) return false;
+  return (
+    (Array.isArray(data.formats) && data.formats.length > 0) ||
+    typeof data.url === "string" ||
+    Array.isArray(data.requested_downloads)
+  );
+}
+
 async function discoverMediaPreview(
   pi: ExtensionAPI,
   cwd: string,
@@ -1653,7 +1876,7 @@ async function discoverMediaPreview(
       true,
       remaining,
     );
-    const data = result.data;
+    let data = result.data;
     let entries: Record<string, unknown>[] = Array.isArray(data?.entries)
       ? data.entries.filter((entry): entry is Record<string, unknown> =>
           Boolean(entry && typeof entry === "object"),
@@ -1663,7 +1886,44 @@ async function discoverMediaPreview(
     const hasRule = rules.rules.some((rule) =>
       discoveryRuleMatchesUrl(url, rule),
     );
-    if (entries.length === 0 && isRtveSeriesUrl(url)) {
+
+    // A bare BBC brand/series permalink 404s in the extractor; its episode index
+    // does not. Retry there instead of falling through to HTML scraping.
+    if (
+      entries.length === 0 &&
+      !isResolvedSingleMedia(data) &&
+      isBbcProgrammePermalinkUrl(url)
+    ) {
+      const indexUrl = bbcEpisodeIndexUrl(url);
+      if (indexUrl && indexUrl !== url) {
+        onUpdate?.(`Resolving ${url} as a programme index`);
+        const retry = await runYtDlpJson(
+          pi,
+          cwd,
+          indexUrl,
+          options,
+          signal,
+          true,
+          remaining,
+        );
+        const retryEntries = Array.isArray(retry.data?.entries)
+          ? retry.data.entries.filter(
+              (entry): entry is Record<string, unknown> =>
+                Boolean(entry && typeof entry === "object"),
+            )
+          : [];
+        if (retryEntries.length > 0) {
+          data = retry.data;
+          entries = retryEntries;
+        }
+      }
+    }
+
+    // yt-dlp resolved the URL to one concrete item. That answer is authoritative:
+    // scraping the page here is what produced nav links like "Skip to content".
+    if (entries.length === 0 && isResolvedSingleMedia(data)) {
+      entries = [data as Record<string, unknown>];
+    } else if (entries.length === 0 && isRtveSeriesUrl(url)) {
       const html = await fetchMediaPageHtml(pi, cwd, url, signal, options);
       entries = extractConfiguredMediaEntries(html, url, [], remaining);
       if (entries.length === 0) {
@@ -1724,7 +1984,29 @@ async function discoverMediaPreview(
     });
     remaining -= selectedEntries.length;
   }
-  const candidates = jobs.flatMap((job) => job.candidates);
+  // Each job numbers its own candidates from 1, but the picker flattens every job
+  // into one list and keys selection by candidate.index — so duplicate indexes
+  // make unrelated entries toggle together. Renumber globally, and drop entries
+  // already contributed by an earlier URL.
+  const seenUrls = new Set<string>();
+  const candidates: MediaPreviewCandidate[] = [];
+  for (const job of jobs) {
+    for (const candidate of job.candidates) {
+      const rawKey =
+        candidate.url || candidate.webpageUrl || candidate.mediaUrl;
+      if (rawKey) {
+        const key = mediaDedupeKey(rawKey);
+        if (seenUrls.has(key)) continue;
+        seenUrls.add(key);
+      }
+      const index = candidates.length + 1;
+      candidates.push({
+        ...candidate,
+        index,
+        displayName: candidate.title || `Media entry ${index}`,
+      });
+    }
+  }
   const warnings = jobs
     .filter((job) => job.candidates.length === 0)
     .map((job) => `Preview failed for ${job.url}: ${job.detail}`);
@@ -2695,25 +2977,24 @@ async function chooseMode(
   return "audio";
 }
 
+// Only "best" is guaranteed never to re-encode: yt-dlp copies the source stream
+// straight into its container. Every other target can invoke an encoder, and
+// which ones do depends on the source codec, so none of them is safe to accept
+// on trust. This parameter is filled in by the model, not the user, so a
+// re-encode is never taken silently — the user confirms it, or it falls back to
+// "best". Cancelling falls back too, because the safe answer is the quiet one.
 async function chooseAudioFormat(
   ui: PickerUI,
   initial: DownloadParams["audioFormat"],
 ): Promise<AudioFormat> {
-  if (initial) return initial;
-  const options = [
-    "Use default: best (keeps best available source audio; extension may vary)",
-    "mp3",
-    "m4a",
-    "opus",
-    "flac",
-    "wav",
-    "aac",
-    "vorbis",
-    "alac",
-  ];
-  const selection = await ui.select("Audio extension", options);
-  if (!selection || selection.startsWith("Use default:")) return "best";
-  return selection as AudioFormat;
+  if (!initial || initial === "best") return "best";
+  const keepSource = "Keep source audio (best, no re-encode)";
+  const convert = `Convert to ${initial} (re-encodes, loses quality)`;
+  const selection = await ui.select(`Convert this audio to ${initial}?`, [
+    keepSource,
+    convert,
+  ]);
+  return selection === convert ? initial : "best";
 }
 
 async function chooseVideoContainer(
@@ -3000,6 +3281,176 @@ function buildJobs(options: {
   return jobs;
 }
 
+// Spelled out in the confirmation because the model picks this parameter and the
+// user is the one who pays for a bad choice.
+function audioFormatQualityNote(format: AudioFormat): string {
+  if (format === "best") return "";
+  if (format === "m4a" || format === "aac")
+    return " — copies AAC sources unchanged, re-encodes anything else";
+  if (format === "flac" || format === "wav" || format === "alac")
+    return " — re-encodes to lossless: no quality gained over a lossy source, much larger files";
+  return ` — WARNING: re-encodes lossy audio into ${format}, losing quality. Omit audioFormat to copy the source stream instead.`;
+}
+
+async function fetchBbcJson(
+  pi: ExtensionAPI,
+  cwd: string,
+  url: string,
+  signal: AbortSignal | undefined,
+): Promise<any | undefined> {
+  try {
+    const result = await pi.exec(
+      "curl",
+      ["-sL", "--max-time", "20", "-A", "Mozilla/5.0", url],
+      { signal, cwd },
+    );
+    if (result.code !== 0 || !result.stdout.trim()) return undefined;
+    return JSON.parse(result.stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+function tracklistCell(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+function tracklistTimestamp(totalSeconds: unknown): string {
+  const seconds = Number(totalSeconds);
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  const whole = Math.floor(seconds);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = whole % 60;
+  return `${hours > 0 ? `${hours}:` : ""}${String(minutes).padStart(
+    hours > 0 ? 2 : 1,
+    "0",
+  )}:${String(rest).padStart(2, "0")}`;
+}
+
+// Named to match the audio file yt-dlp writes ("<date> — <brand>, <episode>"),
+// so the tracklist sorts directly beside the recording it belongs to.
+function bbcTracklistBasename(programme: any): string | undefined {
+  const episodeTitle = String(programme?.title ?? "").trim();
+  if (!episodeTitle) return undefined;
+  const brand = String(
+    programme?.parent?.programme?.title ??
+      programme?.parent?.programme?.parent?.programme?.title ??
+      "",
+  ).trim();
+  const date = String(programme?.first_broadcast_date ?? "").slice(0, 10);
+  const stamp = /^\d{4}-\d{2}-\d{2}$/.test(date)
+    ? date.replace(/-/g, ".")
+    : "UnknownDate";
+  const title = brand ? `${brand}, ${episodeTitle}` : episodeTitle;
+  return `${stamp} — ${title}`.replace(/[/\\:*?"<>|]/g, "-").slice(0, 180);
+}
+
+function buildBbcTracklistMarkdown(
+  programme: any,
+  segmentEvents: any[],
+  pid: string,
+): string | undefined {
+  const tracks = segmentEvents.filter(
+    (event) => event?.segment?.type === "music",
+  );
+  if (tracks.length === 0) return undefined;
+
+  const brand = String(programme?.parent?.programme?.title ?? "").trim();
+  const episodeTitle = String(programme?.title ?? pid).trim();
+  const lines: string[] = [
+    `# ${brand ? `${brand} — ${episodeTitle}` : episodeTitle}`,
+    "",
+  ];
+
+  const facts: string[] = [];
+  const date = String(programme?.first_broadcast_date ?? "").slice(0, 10);
+  if (date) facts.push(`**Broadcast** ${date}`);
+  const station = programme?.ownership?.service?.title;
+  if (station) facts.push(`**Station** ${tracklistCell(station)}`);
+  if (facts.length > 0) lines.push(facts.join(" · "), "");
+
+  lines.push(
+    `[Programme page](https://www.bbc.co.uk/programmes/${pid}) · ` +
+      `[BBC Sounds](https://www.bbc.co.uk/sounds/play/${pid})`,
+    "",
+    `## Tracklist (${tracks.length})`,
+    "",
+    "| # | Time | Artist | Track | Release | Label |",
+    "|---:|---|---|---|---|---|",
+  );
+  tracks.forEach((event, index) => {
+    const segment = event.segment ?? {};
+    lines.push(
+      `| ${event.position ?? index + 1} | ${tracklistTimestamp(
+        event.version_offset,
+      )} | ${tracklistCell(segment.artist)} | ${tracklistCell(
+        segment.track_title,
+      )} | ${tracklistCell(segment.release_title)} | ${tracklistCell(
+        segment.record_label,
+      )} |`,
+    );
+  });
+  lines.push("", "---", "", `Tracklist data from BBC programme \`${pid}\`.`, "");
+  return lines.join("\n");
+}
+
+// BBC publishes the music played during a programme as structured data. Write it
+// out beside the audio, because a recording without its tracklist loses the one
+// thing the listener most often wants to look up afterwards.
+async function writeBbcTracklists(
+  pi: ExtensionAPI,
+  cwd: string,
+  urls: string[],
+  destinationPath: string,
+  signal: AbortSignal | undefined,
+  onUpdate?: (text: string) => void,
+): Promise<{ written: string[]; skipped: string[] }> {
+  const written: string[] = [];
+  const skipped: string[] = [];
+  const pids = dedupeUrls(
+    urls.filter(isBbcProgrammesUrl).map((url) => bbcPidFromUrl(url) ?? ""),
+  ).filter(Boolean);
+  for (const pid of pids) {
+    const [meta, segments] = await Promise.all([
+      fetchBbcJson(pi, cwd, `https://www.bbc.co.uk/programmes/${pid}.json`, signal),
+      fetchBbcJson(
+        pi,
+        cwd,
+        `https://www.bbc.co.uk/programmes/${pid}/segments.json`,
+        signal,
+      ),
+    ]);
+    const programme = meta?.programme;
+    const events = Array.isArray(segments?.segment_events)
+      ? segments.segment_events
+      : [];
+    const markdown = programme
+      ? buildBbcTracklistMarkdown(programme, events, pid)
+      : undefined;
+    const base = programme ? bbcTracklistBasename(programme) : undefined;
+    if (!markdown || !base) {
+      skipped.push(pid);
+      continue;
+    }
+    const target = join(destinationPath, `${base}.md`);
+    try {
+      await writeFile(target, markdown, "utf8");
+      written.push(target);
+    } catch {
+      skipped.push(pid);
+    }
+  }
+  if (written.length > 0)
+    onUpdate?.(
+      `Wrote ${written.length} tracklist${written.length === 1 ? "" : "s"}`,
+    );
+  return { written, skipped };
+}
+
 function buildPlanSummary(options: {
   mode: DownloadMode;
   destinationPath: string;
@@ -3023,8 +3474,13 @@ function buildPlanSummary(options: {
     `Destination: ${options.destinationPath} (${options.destinationSource})`,
   );
   if (options.mode === "audio") {
+    const audioFormat = options.audioFormat ?? "best";
     lines.push(
-      `Audio extension: ${options.audioFormat ?? "best"}${options.audioFormat ? "" : " (default)"}`,
+      `Audio extension: ${audioFormat}${
+        options.audioFormat
+          ? audioFormatQualityNote(audioFormat)
+          : " (default — copies the source stream, no re-encode)"
+      }`,
     );
   } else if (options.compatibilityProfile === "mac-lg-tv") {
     lines.push(
@@ -3129,8 +3585,11 @@ export default function ytDlpFfmpegExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use this tool for media download requests instead of generating raw yt-dlp commands.",
       "Provide all user URLs in one call whenever possible.",
-      "List-like playlist, series, feed, BBC, and RTVE URLs show a selectable list preview when playlistMode is omitted; preview=true forces it for any URL.",
+      "URLs that name one item — including BBC /programmes/<pid> episode links — download directly with no list preview.",
+      "Only genuine collections (playlists, series, feeds, episode indexes) show the selectable list preview when playlistMode is omitted; preview=true forces it for any URL.",
+      "Pass every episode URL in one call; there is no need to split a bulk list or to pick entries yourself.",
       "Preview discovery never downloads media. Only the entries explicitly selected in the list may reach the normal download confirmation.",
+      "NEVER pass audioFormat unless the user explicitly named a format. Omitting it keeps the source audio unchanged; choosing mp3/opus/vorbis yourself silently destroys quality.",
       "NEVER manually ask the user about browser cookies — the tool presents that picker itself. Just call the tool.",
       "NEVER run mkdir or bash to pre-create the destination folder — the tool creates it automatically.",
       "destinationPath accepts ~/... paths as well as absolute paths — pass it directly as the user stated it.",
@@ -3153,7 +3612,7 @@ export default function ytDlpFfmpegExtension(pi: ExtensionAPI) {
         };
       }
 
-      const urls = dedupeUrls(params.urls);
+      let urls = dedupeUrls(params.urls);
       if (urls.length === 0) {
         return {
           content: [
@@ -3178,6 +3637,16 @@ export default function ytDlpFfmpegExtension(pi: ExtensionAPI) {
             ? "mp4"
             : await chooseVideoContainer(ctx.ui, params.videoContainer)
           : undefined;
+      // /programmes/<pid> is the shape of both a single episode and a whole
+      // brand, so ask BBC which it is before deciding whether a picker is
+      // warranted. Episode URLs stay single and skip the picker entirely.
+      urls = await resolveBbcProgrammeUrls(pi, ctx.cwd, urls, signal, (text) =>
+        onUpdate?.({
+          content: [{ type: "text", text }],
+          details: { phase: "resolve" },
+        }),
+      );
+
       const shouldPreview =
         params.preview === true ||
         (params.playlistMode === undefined && urls.some(isMediaPlaylistUrl));
@@ -3533,7 +4002,30 @@ export default function ytDlpFfmpegExtension(pi: ExtensionAPI) {
         });
       }
 
-      const summary = summarizeResults(results, destinationSelection.path);
+      const succeededUrls = jobs
+        .filter((_job, index) => results[index]?.code === 0)
+        .flatMap((job) => job.urls);
+      const tracklists =
+        params.tracklist === false || succeededUrls.length === 0
+          ? { written: [], skipped: [] }
+          : await writeBbcTracklists(
+              pi,
+              ctx.cwd,
+              succeededUrls,
+              destinationSelection.path,
+              signal,
+              (text) =>
+                onUpdate?.({
+                  content: [{ type: "text", text }],
+                  details: { phase: "tracklist" },
+                }),
+            );
+
+      let summary = summarizeResults(results, destinationSelection.path);
+      if (tracklists.written.length > 0)
+        summary += `\n\nTracklists written: ${tracklists.written.length}\n${tracklists.written
+          .map((path) => `  ${basename(path)}`)
+          .join("\n")}`;
       const hasFailure = results.some((result) => result.code !== 0);
       return {
         content: [{ type: "text", text: summary }],
@@ -3552,6 +4044,7 @@ export default function ytDlpFfmpegExtension(pi: ExtensionAPI) {
           playlistItems,
           sleepRequests,
           jobs: results,
+          tracklists: tracklists.written,
         },
         isError: hasFailure,
       };

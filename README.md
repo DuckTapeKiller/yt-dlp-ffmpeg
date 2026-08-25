@@ -7,6 +7,8 @@ This folder is a local Pi package for guided media download workflows.
 - `package.json` declares the Pi package metadata.
 - `index.ts` is the package entrypoint Pi loads.
 - `yt-dlp-ffmpeg.ts` contains the extension implementation.
+- `scripts/` holds standalone BBC helpers that run outside the extension.
+- `test/` holds the Node test suite; run it with `npm test`.
 
 ## What it does
 
@@ -21,7 +23,13 @@ This folder is a local Pi package for guided media download workflows.
 - Continues playlist downloads past individual failed items by default.
 - Supports playlist item ranges and request throttling.
 - Adds selectable, list-only media previews for playlists, series, episode lists, feeds, and collection pages. Previewing never downloads media.
-- Automatically previews list-like URLs when `playlistMode` is omitted and also supports `preview: true` for an explicit preview request.
+- Automatically previews genuine collection URLs when `playlistMode` is omitted and also supports `preview: true` for an explicit preview request.
+- Downloads single-item URLs directly, with no preview. A URL that already names one episode is taken at face value, so bulk lists of episode links go straight to the download confirmation.
+- Resolves BBC `/programmes/<pid>` links against BBC's own programme descriptor, because that URL shape covers both a single episode and a whole brand. Brand and series links are expanded into their episode index; episode links are downloaded directly. When the descriptor is unreachable the link is left exactly as given.
+- Rewrites every BBC Sounds link (`/sounds/play/`, `/sounds/brand/`, `/sounds/series/`) to its `/programmes/` equivalent. yt-dlp's BBC extractor fails on all Sounds forms with "Unable to extract playlist data"; the same pid under `/programmes/` resolves normally.
+- Dates BBC filenames from the JSON-LD `datePublished`, which matches BBC's own `first_broadcast_date`. The page also carries a repeat broadcast and an availability expiry, either of which would misdate the file by weeks.
+- Writes a Markdown tracklist beside each downloaded BBC programme that publishes one, named to match the audio file so the pair sorts together. Only jobs that exited cleanly produce one, and a programme with no published tracklist produces no file rather than an empty one. Set `tracklist: false` to skip.
+- Never re-encodes audio on its own initiative. `audioFormat` unset or `best` copies the source stream and asks nothing; any other value is confirmed with the user first, and declining or cancelling falls back to `best`.
 - Shows title, date, duration, availability, and selection state without rendering thumbnails.
 - Downloads only the explicitly selected stable entry URLs, then keeps the normal Pi confirmation step before yt-dlp runs.
 - Supports up to 500 preview entries by default; set `maxPlaylistEntries` to use a smaller bound.
@@ -34,6 +42,35 @@ This folder is a local Pi package for guided media download workflows.
   - `/media-rule-test`
   - `/media-rule-list`
   - `/media-rule-remove`
+
+## Helper scripts
+
+Two standalone scripts in `scripts/` cover BBC work that the download tool does
+not. Both take a URL in any BBC form, or a bare programme id.
+
+`bbc-episodes.mjs` lists every episode of a brand or series. It walks the
+paginated episode index, which yt-dlp does not — yt-dlp reads page one only, so
+the download picker sees fewer episodes than this script does. Prints one
+programme URL per line on stdout and writes a Markdown table of date, title,
+URL, and remaining listen window.
+
+```
+node scripts/bbc-episodes.mjs https://www.bbc.co.uk/sounds/brand/<pid> [outputDir] [--urls-only]
+```
+
+`bbc-tracklist.mjs` writes tracklists without downloading anything. It accepts
+several URLs at once, or a list piped on stdin, so it composes with the
+enumerator.
+
+```
+node scripts/bbc-tracklist.mjs <url-or-pid>... [--out <dir>]
+node scripts/bbc-episodes.mjs <brand-url> --urls-only | node scripts/bbc-tracklist.mjs
+```
+
+Both read BBC's own JSON APIs rather than scraping the player, which is
+JavaScript-rendered and serves no tracklist in its HTML. Both exit non-zero when
+an input genuinely fails; a programme that simply publishes no tracklist is
+reported separately and is not treated as a failure.
 
 ## Requirements
 
@@ -76,7 +113,7 @@ Example Pi tool parameters:
 }
 ```
 
-For a list-like URL, the preview is automatic. In the list, use Up/Down to move, Space to toggle, `a` to select all, `n` to clear all, Enter to continue to the normal download confirmation, and Escape to cancel.
+For a collection URL, the preview is automatic. A URL that names a single item skips the list entirely and goes straight to the download confirmation. In the list, use Up/Down to move, Space to toggle, `a` to select all, `n` to clear all, Enter to continue to the normal download confirmation, and Escape to cancel.
 
 Use `"chrome"`, `"firefox"`, `"brave"`, etc. instead of `"safari"` if that is where you are logged into YouTube. If a browser profile is locked, close the browser and retry. If a rightsholder blocks playback even in the browser, cookies cannot bypass that.
 
